@@ -15,14 +15,8 @@ from changedetectionio.processors.text_json_diff.processor import (
     perform_site_check as text_site_check,
 )
 
-
-def _(value):
-    return value
-
-
-name = _('Webpage and linked file changes')
-description = _('Detects normal page changes plus byte-level changes to linked documents and archives')
-del _
+name = 'Webpage and linked file changes'
+description = 'Detects normal page changes plus byte-level changes to linked documents and archives'
 processor_weight = -90
 list_badge_text = 'Page + files'
 
