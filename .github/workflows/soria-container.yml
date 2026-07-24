@@ -39,3 +39,11 @@ jobs:
           tags: ghcr.io/soria-inc/changedetection.io:soria-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Allow ECS to pull the image without registry credentials
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh api --method PATCH
+          /orgs/soria-inc/packages/container/changedetection.io
+          -f visibility=public
