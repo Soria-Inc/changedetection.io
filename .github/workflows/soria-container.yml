@@ -37,6 +37,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ghcr.io/soria-inc/changedetection.io:soria-${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/Soria-Inc/changedetection.io
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -45,5 +46,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >-
           gh api --method PATCH
-          /orgs/soria-inc/packages/container/changedetection.io
+          /orgs/Soria-Inc/packages/container/changedetection.io
           -f visibility=public
