@@ -109,6 +109,7 @@ _Need an actual Chrome runner with Javascript support? We support fetching via W
 - Target elements with xPath 1 and xPath 2, CSS Selectors, Easily monitor complex JSON with JSONPath or jq
 - Switch between fast non-JS and Chrome JS based "fetchers"
 - Track changes in PDF files (Monitor text changed in the PDF, Also monitor PDF filesize and checksums)
+- Monitor a webpage and its linked documents together with [HEAD-first, streaming SHA-256 checks](docs/page-and-files.md)
 - Easily specify how often a site should be checked
 - Execute JS before extracting text (Good for logging in, see examples in the UI!)
 - Override Request Headers, Specify `POST` or `GET` and other methods

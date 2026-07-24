@@ -420,9 +420,9 @@ components:
           description: Browser automation steps. Maximum 100 steps allowed.
         processor:
           type: string
-          enum: [restock_diff, text_json_diff]
+          enum: [page_and_files, restock_diff, text_json_diff]
           default: text_json_diff
-          description: Optional processor mode to use for change detection. Defaults to `text_json_diff` if not specified.
+          description: Optional processor mode to use for change detection. `page_and_files` monitors normal page content plus linked document fingerprints. Defaults to `text_json_diff` if not specified.
 
         # Content Filtering
         include_filters:
