@@ -1,5 +1,6 @@
 import concurrent.futures
 import hashlib
+import json
 import os
 import threading
 import time
@@ -22,6 +23,8 @@ _SAFE_CROSS_ORIGIN_HEADERS = frozenset({'accept', 'accept-language', 'user-agent
 _limiter_lock = threading.Lock()
 _global_limiters = {}
 _host_limiters = {}
+_inflight_lock = threading.Lock()
+_inflight_fingerprints = {}
 
 
 def _origin(url):
@@ -38,13 +41,23 @@ def _headers_for_url(headers, source_url, request_url):
     return headers
 
 
+def _worker_limit(name, default):
+    legacy_limit = os.getenv('LINKED_FILE_GLOBAL_WORKERS')
+    return max(1, int(os.getenv(name, legacy_limit or default)))
+
+
 @contextmanager
-def _request_capacity(url):
-    global_limit = max(1, int(os.getenv('LINKED_FILE_GLOBAL_WORKERS', '4')))
+def _request_capacity(url, phase):
+    setting = 'LINKED_FILE_HEAD_GLOBAL_WORKERS' if phase == 'head' else 'LINKED_FILE_HASH_WORKERS'
+    default = '16' if phase == 'head' else '4'
+    global_limit = _worker_limit(setting, default)
     per_host_limit = max(1, int(os.getenv('LINKED_FILE_PER_HOST_WORKERS', '2')))
     hostname = (urlparse(url).hostname or '').lower()
     with _limiter_lock:
-        global_limiter = _global_limiters.setdefault(global_limit, threading.BoundedSemaphore(global_limit))
+        global_limiter = _global_limiters.setdefault(
+            (phase, global_limit),
+            threading.BoundedSemaphore(global_limit),
+        )
         host_limiter = _host_limiters.setdefault(
             (per_host_limit, hostname),
             threading.BoundedSemaphore(per_host_limit),
@@ -52,6 +65,34 @@ def _request_capacity(url):
     with global_limiter:
         with host_limiter:
             yield
+
+
+def _verification_interval(url):
+    interval = int(os.getenv('LINKED_FILE_VERIFY_INTERVAL_SECONDS', '604800'))
+    if interval <= 0:
+        return 0
+    jitter = min(interval, max(0, int(os.getenv('LINKED_FILE_VERIFY_JITTER_SECONDS', '86400'))))
+    if not jitter:
+        return interval
+    offset = int.from_bytes(hashlib.sha256(url.encode()).digest()[:8], 'big') % (jitter + 1)
+    return max(1, interval - jitter // 2 + offset)
+
+
+def _fingerprint_key(url, previous, *, source_url, headers, proxies, timeout, now):
+    previous = previous or {}
+    cache_scope = {
+        'url': url,
+        'source_origin': _origin(source_url) if source_url else None,
+        'headers': sorted(_headers_for_url(headers, source_url, url).items()),
+        'proxies': sorted((proxies or {}).items()),
+        'timeout': timeout,
+        'previous': {
+            key: previous.get(key, '')
+            for key in (*METADATA_KEYS, 'sha256', 'last_hashed_at')
+        },
+        'verification_due': now - float(previous.get('last_hashed_at') or 0) >= _verification_interval(url),
+    }
+    return hashlib.sha256(json.dumps(cache_scope, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def discover_file_urls(html, page_url):
@@ -124,12 +165,12 @@ def _metadata(url, final_url, headers):
     }
 
 
-def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
+def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
     previous = previous or {}
     head_session = head = None
-    with _request_capacity(url):
-        request_session = requests.Session()
-        try:
+    request_session = requests.Session()
+    try:
+        with _request_capacity(url, 'head'):
             head_session, head, final_url = _request_with_redirects(
                 'HEAD',
                 url,
@@ -144,20 +185,20 @@ def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, no
             head.close()
             head = head_session = None
 
-            metadata_changed = any(str(previous.get(key, '')) != str(metadata[key]) for key in METADATA_KEYS)
-            reliable_headers = bool(metadata['etag'] or metadata['last_modified'] or metadata['content_length'])
-            verify_interval = int(os.getenv('LINKED_FILE_VERIFY_INTERVAL_SECONDS', '604800'))
-            needs_hash = (
-                not previous.get('sha256')
-                or metadata_changed
-                or not reliable_headers
-                or not head_supported
-                or now - float(previous.get('last_hashed_at') or 0) >= verify_interval
-            )
+        metadata_changed = any(str(previous.get(key, '')) != str(metadata[key]) for key in METADATA_KEYS)
+        reliable_headers = bool(metadata['etag'] or metadata['last_modified'] or metadata['content_length'])
+        needs_hash = (
+            not previous.get('sha256')
+            or metadata_changed
+            or not reliable_headers
+            or not head_supported
+            or now - float(previous.get('last_hashed_at') or 0) >= _verification_interval(url)
+        )
 
-            if not needs_hash:
-                return {**metadata, 'sha256': previous['sha256'], 'last_hashed_at': previous['last_hashed_at']}
+        if not needs_hash:
+            return {**metadata, 'sha256': previous['sha256'], 'last_hashed_at': previous['last_hashed_at']}
 
+        with _request_capacity(url, 'hash'):
             _, response, final_url = _request_with_redirects(
                 'GET',
                 url,
@@ -195,20 +236,65 @@ def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, no
                 return {**metadata, 'sha256': digest.hexdigest(), 'last_hashed_at': now}
             finally:
                 response.close()
-        except Exception as exc:
-            if head is not None:
-                head.close()
-            if head_session is not None:
-                head_session.close()
-            preserved = {key: previous.get(key, '') for key in (*METADATA_KEYS, 'sha256', 'last_hashed_at')}
-            return {'url': url, **preserved, 'error': str(exc)[:300]}
-        finally:
-            request_session.close()
+    except Exception as exc:
+        if head is not None:
+            head.close()
+        if head_session is not None:
+            head_session.close()
+        preserved = {key: previous.get(key, '') for key in (*METADATA_KEYS, 'sha256', 'last_hashed_at')}
+        return {'url': url, **preserved, 'error': str(exc)[:300]}
+    finally:
+        request_session.close()
+
+
+def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
+    key = _fingerprint_key(
+        url,
+        previous,
+        source_url=source_url,
+        headers=headers,
+        proxies=proxies,
+        timeout=timeout,
+        now=now,
+    )
+    with _inflight_lock:
+        future = _inflight_fingerprints.get(key)
+        owner = future is None
+        if owner:
+            future = concurrent.futures.Future()
+            _inflight_fingerprints[key] = future
+    if not owner:
+        return dict(future.result())
+
+    try:
+        result = _fingerprint_file(
+            url,
+            previous,
+            source_url=source_url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            now=now,
+        )
+        future.set_result(result)
+        return result
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _inflight_lock:
+            _inflight_fingerprints.pop(key, None)
 
 
 def fingerprint_files(urls, previous_state, *, source_url, headers, proxies, timeout):
     maximum = max(1, int(os.getenv('LINKED_FILE_MAX_LINKS', '200')))
-    selected_urls = urls[:maximum]
+    selected_urls = list(urls[:maximum])
+    if len(selected_urls) > 1:
+        offset = (
+            int.from_bytes(hashlib.sha256((source_url or '').encode()).digest()[:8], 'big')
+            % len(selected_urls)
+        )
+        selected_urls = selected_urls[offset:] + selected_urls[:offset]
     previous_files = (previous_state or {}).get('files') or {}
     now = time.time()
     worker_limit = max(1, int(os.getenv('LINKED_FILE_HEAD_WORKERS', '2')))

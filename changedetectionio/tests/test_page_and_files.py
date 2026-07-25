@@ -13,6 +13,7 @@ from flask import url_for
 
 from changedetectionio.processors.page_and_files.linked_files import (
     _request_with_redirects,
+    _verification_interval,
     discover_file_urls,
     fingerprint_file,
     fingerprint_files,
@@ -168,6 +169,8 @@ def test_linked_file_concurrency_is_globally_and_per_host_bounded():
     lock = threading.Lock()
     active = 0
     maximum_active = 0
+    active_by_method = defaultdict(int)
+    maximum_by_method = defaultdict(int)
     active_by_host = defaultdict(int)
     maximum_by_host = defaultdict(int)
 
@@ -176,12 +179,15 @@ def test_linked_file_concurrency_is_globally_and_per_host_bounded():
         host = url.split('/')[2]
         with lock:
             active += 1
+            active_by_method[method] += 1
             active_by_host[host] += 1
             maximum_active = max(maximum_active, active)
+            maximum_by_method[method] = max(maximum_by_method[method], active_by_method[method])
             maximum_by_host[host] = max(maximum_by_host[host], active_by_host[host])
         time.sleep(0.01)
         with lock:
             active -= 1
+            active_by_method[method] -= 1
             active_by_host[host] -= 1
         return FakeSession(), FakeResponse(url), url
 
@@ -217,8 +223,135 @@ def test_linked_file_concurrency_is_globally_and_per_host_bounded():
         for future in futures:
             assert len(future.result()['files']) == 8
 
-    assert maximum_active <= 4
+    assert maximum_active <= 8
+    assert maximum_by_method['HEAD'] <= 4
+    assert maximum_by_method['GET'] <= 4
     assert max(maximum_by_host.values()) <= 2
+
+
+def test_head_and_hash_concurrency_are_bounded_separately():
+    lock = threading.Lock()
+    active = defaultdict(int)
+    maximum = defaultdict(int)
+
+    def request(method, url, **kwargs):
+        with lock:
+            active[method] += 1
+            maximum[method] = max(maximum[method], active[method])
+        time.sleep(0.02)
+        with lock:
+            active[method] -= 1
+        return FakeSession(), FakeResponse(url), url
+
+    urls = [f'https://host{index % 10}.example/file-{index}.pdf' for index in range(80)]
+    previous = {
+        'files': {
+            url: {
+                'url': url,
+                'final_url': url,
+                'etag': url,
+                'last_modified': '',
+                'content_length': '1',
+                'content_type': '',
+                'sha256': 'existing',
+                'last_hashed_at': time.time(),
+            }
+            for url in urls
+        }
+    }
+    environment = {
+        'LINKED_FILE_HEAD_GLOBAL_WORKERS': '16',
+        'LINKED_FILE_HASH_WORKERS': '4',
+        'LINKED_FILE_PER_HOST_WORKERS': '20',
+        'LINKED_FILE_HEAD_WORKERS': '20',
+    }
+    with (
+        patch.dict(os.environ, environment),
+        patch(
+            'changedetectionio.processors.page_and_files.linked_files._request_with_redirects',
+            side_effect=request,
+        ),
+    ):
+        fingerprint_files(
+            urls,
+            previous,
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=5,
+        )
+        assert maximum['HEAD'] > 4
+        assert maximum['HEAD'] <= 16
+        assert maximum['GET'] == 0
+
+        fingerprint_files(
+            urls,
+            {},
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=5,
+        )
+
+    assert maximum['HEAD'] <= 16
+    assert maximum['GET'] <= 4
+
+
+def test_duplicate_file_checks_are_coalesced_without_crossing_credentials():
+    result = {'url': 'https://files.example/shared.pdf', 'sha256': 'digest'}
+
+    def check_once(*args, **kwargs):
+        time.sleep(0.05)
+        return result
+
+    def call(headers, previous=None):
+        return fingerprint_file(
+            result['url'],
+            previous or {},
+            source_url='https://files.example/page',
+            headers=headers,
+            proxies={},
+            timeout=5,
+            now=1,
+        )
+
+    with (
+        patch(
+            'changedetectionio.processors.page_and_files.linked_files._fingerprint_file',
+            side_effect=check_once,
+        ) as underlying,
+        concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor,
+    ):
+        futures = [executor.submit(call, {'Authorization': 'Bearer same'}) for _ in range(20)]
+        assert all(future.result() == result for future in futures)
+        assert underlying.call_count == 1
+
+        first = executor.submit(call, {'Authorization': 'Bearer first'})
+        second = executor.submit(call, {'Authorization': 'Bearer second'})
+        assert first.result() == second.result() == result
+        assert underlying.call_count == 3
+
+        first = executor.submit(call, {}, {'sha256': 'digest', 'last_hashed_at': 1})
+        second = executor.submit(call, {}, {'sha256': 'digest', 'last_hashed_at': 2})
+        assert first.result() == second.result() == result
+        assert underlying.call_count == 5
+
+
+def test_full_hash_backstop_is_deterministically_spread():
+    with patch.dict(
+        os.environ,
+        {
+            'LINKED_FILE_VERIFY_INTERVAL_SECONDS': '604800',
+            'LINKED_FILE_VERIFY_JITTER_SECONDS': '86400',
+        },
+    ):
+        first = _verification_interval('https://files.example/first.pdf')
+        assert first == _verification_interval('https://files.example/first.pdf')
+        assert 561600 <= first <= 648000
+        assert first != _verification_interval('https://files.example/second.pdf')
+
+    with patch.dict(os.environ, {'LINKED_FILE_VERIFY_INTERVAL_SECONDS': '0'}):
+        assert _verification_interval('https://files.example/first.pdf') == 0
 
 
 def test_linked_file_state_is_saved_only_after_page_processing_succeeds():
