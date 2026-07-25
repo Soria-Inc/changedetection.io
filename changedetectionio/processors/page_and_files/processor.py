@@ -22,8 +22,7 @@ list_badge_text = 'Page + files'
 
 
 class perform_site_check(text_site_check):
-    async def call_browser(self, preferred_proxy_id=None):
-        await super().call_browser(preferred_proxy_id=preferred_proxy_id)
+    def _fingerprint_linked_files(self):
         if not isinstance(self.fetcher.content, str):
             return
 
@@ -48,10 +47,10 @@ class perform_site_check(text_site_check):
         }
         timeout = self.datastore.data['settings']['requests'].get('timeout')
         previous = self.get_extra_watch_config('linked_files.json')
-        state = await asyncio.to_thread(
-            fingerprint_files,
+        state = fingerprint_files(
             urls,
             previous,
+            source_url=self.watch.link,
             headers=request_headers,
             proxies=proxies,
             timeout=timeout,
@@ -63,7 +62,14 @@ class perform_site_check(text_site_check):
         self.fetcher.supplemental_change_content = render_snapshot(snapshot)
         self.linked_files_state = state
 
+    async def call_browser(self, preferred_proxy_id=None):
+        await super().call_browser(preferred_proxy_id=preferred_proxy_id)
+        await asyncio.to_thread(self._fingerprint_linked_files)
+
     def run_changedetection(self, watch, force_reprocess=False):
+        if not hasattr(self, 'linked_files_state'):
+            self._fingerprint_linked_files()
+        result = super().run_changedetection(watch, force_reprocess=force_reprocess)
         if hasattr(self, 'linked_files_state'):
             self.update_extra_watch_config('linked_files.json', self.linked_files_state, merge=False)
-        return super().run_changedetection(watch, force_reprocess=force_reprocess)
+        return result

@@ -602,18 +602,6 @@ class perform_site_check(difference_detection_processor):
             if strip_ignored_lines:
                 stripped_text = text_for_checksuming
 
-        # Processors that enrich a normal page check can append stable evidence
-        # after page selectors and ignore rules have run. This keeps linked-file
-        # fingerprints visible and prevents page-only filters from hiding them.
-        supplemental_content = getattr(self.fetcher, 'supplemental_change_content', None)
-        if supplemental_content:
-            stripped_text = f"{stripped_text.rstrip()}\n\n{supplemental_content}"
-            text_for_checksuming = f"{text_for_checksuming.rstrip()}\n\n{supplemental_content}"
-
-        # Calculate checksum
-        ignore_whitespace = self.datastore.data['settings']['application'].get('ignore_whitespace', False)
-        fetched_md5 = ChecksumCalculator.calculate(text_for_checksuming, ignore_whitespace=ignore_whitespace)
-
         # === BLOCKING RULES EVALUATION ===
         blocked = False
 
@@ -628,6 +616,19 @@ class perform_site_check(difference_detection_processor):
         # Check custom conditions
         if rule_engine.evaluate_conditions(watch, self.datastore, stripped_text):
             blocked = True
+
+        # Processors that enrich a normal page check can append stable evidence
+        # after page selectors, ignore rules, and page-content blocking rules have
+        # run. Linked-file URLs and hashes must participate in the diff without
+        # accidentally satisfying a page trigger or blocking condition.
+        supplemental_content = getattr(self.fetcher, 'supplemental_change_content', None)
+        if supplemental_content:
+            stripped_text = f"{stripped_text.rstrip()}\n\n{supplemental_content}"
+            text_for_checksuming = f"{text_for_checksuming.rstrip()}\n\n{supplemental_content}"
+
+        # Calculate checksum
+        ignore_whitespace = self.datastore.data['settings']['application'].get('ignore_whitespace', False)
+        fetched_md5 = ChecksumCalculator.calculate(text_for_checksuming, ignore_whitespace=ignore_whitespace)
 
         # === CHANGE DETECTION ===
         if blocked:

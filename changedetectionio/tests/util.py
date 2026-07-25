@@ -403,13 +403,14 @@ def new_live_server_setup(live_server):
     def test_checksum_endpoint():
         datastore_path = current_app.config.get('TEST_DATASTORE_PATH', 'test-datastore')
         counter_path = os.path.join(datastore_path, 'endpoint-test-checksum-counts.json')
-        counts = {'GET': 0, 'HEAD': 0}
-        if os.path.isfile(counter_path):
-            with open(counter_path, encoding='utf-8') as counter_file:
-                counts.update(json.load(counter_file))
-        counts[request.method] += 1
-        with open(counter_path, 'w', encoding='utf-8') as counter_file:
-            json.dump(counts, counter_file)
+        with _test_endpoint_content_lock:
+            counts = {'GET': 0, 'HEAD': 0}
+            if os.path.isfile(counter_path):
+                with open(counter_path, encoding='utf-8') as counter_file:
+                    counts.update(json.load(counter_file))
+            counts[request.method] += 1
+            with open(counter_path, 'w', encoding='utf-8') as counter_file:
+                json.dump(counts, counter_file)
 
         file_path = os.path.join(datastore_path, 'endpoint-test-checksum.bin')
         with open(file_path, 'rb') as source_file:
