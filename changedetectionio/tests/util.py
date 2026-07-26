@@ -3,6 +3,8 @@ from operator import truediv
 
 from flask import make_response, request, current_app
 from flask import url_for
+import hashlib
+import json
 import logging
 import time
 import os
@@ -395,6 +397,43 @@ def new_live_server_setup(live_server):
             resp = make_response(f.read(), 200)
             resp.headers['Content-Type'] = 'application/pdf'
             return resp
+
+    @live_server.app.route('/endpoint-test-checksum.bin', methods=['GET', 'HEAD'])
+    @live_server.app.route('/endpoint-test-checksum.zip', methods=['GET', 'HEAD'])
+    def test_checksum_endpoint():
+        datastore_path = current_app.config.get('TEST_DATASTORE_PATH', 'test-datastore')
+        counter_path = os.path.join(datastore_path, 'endpoint-test-checksum-counts.json')
+        with _test_endpoint_content_lock:
+            counts = {'GET': 0, 'HEAD': 0}
+            if os.path.isfile(counter_path):
+                with open(counter_path, encoding='utf-8') as counter_file:
+                    counts.update(json.load(counter_file))
+            counts[request.method] += 1
+            with open(counter_path, 'w', encoding='utf-8') as counter_file:
+                json.dump(counts, counter_file)
+
+        file_path = os.path.join(datastore_path, 'endpoint-test-checksum.bin')
+        with open(file_path, 'rb') as source_file:
+            content = source_file.read()
+        response = make_response(content if request.method == 'GET' else b'', 200)
+        response.headers['Content-Type'] = 'application/octet-stream'
+        response.headers['Content-Length'] = str(len(content))
+        response.headers['ETag'] = (
+            'fixed-metadata' if request.args.get('fixed_metadata') else hashlib.sha256(content).hexdigest()[:16]
+        )
+        return response
+
+    @live_server.app.route('/endpoint-test-page-and-files')
+    def test_page_and_files_endpoint():
+        datastore_path = current_app.config.get('TEST_DATASTORE_PATH', 'test-datastore')
+        manifest_path = os.path.join(datastore_path, 'endpoint-test-page-and-files.json')
+        with open(manifest_path, encoding='utf-8') as manifest_file:
+            manifest = json.load(manifest_file)
+        links = ''.join(
+            f'<a href="{href}">{index}</a>'
+            for index, href in enumerate(manifest.get('links') or [])
+        )
+        return f"<html><body><main>{manifest.get('text', '')}</main>{links}</body></html>"
 
     @live_server.app.route('/test-interactive-html-endpoint')
     def test_interactive_html_endpoint():
