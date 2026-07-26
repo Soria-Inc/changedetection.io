@@ -87,8 +87,8 @@ def _fingerprint_key(url, previous, *, source_url, headers, proxies, timeout, no
         'proxies': sorted((proxies or {}).items()),
         'timeout': timeout,
         'previous': {
-            key: previous.get(key, '')
-            for key in (*METADATA_KEYS, 'sha256', 'last_hashed_at')
+            **{key: previous.get(key, '') for key in (*METADATA_KEYS, 'sha256', 'last_hashed_at')},
+            'check_metadata': previous.get('check_metadata') or {},
         },
         'verification_due': now - float(previous.get('last_hashed_at') or 0) >= _verification_interval(url),
     }
@@ -324,7 +324,12 @@ def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, n
             session=request_session,
         )
 
-        metadata_changed = any(str(previous.get(key, '')) != str(metadata[key]) for key in METADATA_KEYS)
+        previous_check_metadata = previous.get('check_metadata') or {
+            key: previous.get(key, '') for key in METADATA_KEYS
+        }
+        metadata_changed = any(
+            str(previous_check_metadata.get(key, '')) != str(metadata[key]) for key in METADATA_KEYS
+        )
         reliable_headers = bool(metadata['etag'] or metadata['last_modified'] or metadata['content_length'])
         needs_hash = (
             not previous.get('sha256')
@@ -336,9 +341,12 @@ def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, n
 
         if not needs_hash:
             return {
-                **metadata,
+                'url': url,
+                **{key: previous.get(key, metadata[key]) for key in METADATA_KEYS},
                 'sha256': previous['sha256'],
                 'last_hashed_at': previous['last_hashed_at'],
+                'check_metadata': {key: metadata[key] for key in METADATA_KEYS},
+                'fetch_route': previous.get('fetch_route', ''),
                 'metadata_route': metadata_route,
                 **({'waterfall_tier': metadata_tier} if metadata_route == 'metadata_waterfall' else {}),
             }
@@ -352,6 +360,7 @@ def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, n
             session=request_session,
             now=now,
         )
+        result['check_metadata'] = {key: metadata[key] for key in METADATA_KEYS}
         result['metadata_route'] = metadata_route
         return result
     except Exception as exc:
@@ -364,6 +373,7 @@ def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, n
                 'fetch_route',
                 'metadata_route',
                 'waterfall_tier',
+                'check_metadata',
             )
         }
         return {'url': url, **preserved, 'error': str(exc)[:300]}

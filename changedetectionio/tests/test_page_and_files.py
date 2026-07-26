@@ -259,7 +259,8 @@ def test_blocked_head_uses_metadata_waterfall_without_redownloading_unchanged_fi
                 'X-Soria-Upstream-Final-URL': 'https%3A%2F%2Ffiles.example%2Freport.zip',
                 'X-Soria-Upstream-ETag': 'release-7',
                 'X-Soria-Upstream-Last-Modified': 'Tue, 21 Jul 2026 10:00:00 GMT',
-                'X-Soria-Upstream-Content-Length': '1234',
+                # Some government servers return a stable but incorrect HEAD length.
+                'X-Soria-Upstream-Content-Length': '20',
                 'X-Soria-Upstream-Content-Type': 'application/zip',
                 'X-Soria-Waterfall-Tier': 'kernel_stealth',
             }
@@ -271,10 +272,17 @@ def test_blocked_head_uses_metadata_waterfall_without_redownloading_unchanged_fi
         'final_url': 'https://files.example/report.zip',
         'etag': 'release-7',
         'last_modified': 'Tue, 21 Jul 2026 10:00:00 GMT',
-        'content_length': '1234',
+        'content_length': '13667',
         'content_type': 'application/zip',
         'sha256': 'existing-sha',
         'last_hashed_at': 100,
+        'check_metadata': {
+            'final_url': 'https://files.example/report.zip',
+            'etag': 'release-7',
+            'last_modified': 'Tue, 21 Jul 2026 10:00:00 GMT',
+            'content_length': '20',
+            'content_type': 'application/zip',
+        },
     }
     with (
         patch.dict(
@@ -301,6 +309,8 @@ def test_blocked_head_uses_metadata_waterfall_without_redownloading_unchanged_fi
         )
 
     assert result['sha256'] == 'existing-sha'
+    assert result['content_length'] == '13667'
+    assert result['check_metadata']['content_length'] == '20'
     assert result['metadata_route'] == 'metadata_waterfall'
     assert result['waterfall_tier'] == 'kernel_stealth'
     assert fallback.call_count == 1
