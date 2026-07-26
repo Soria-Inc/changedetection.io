@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import asyncio
 import concurrent.futures
 import hashlib
 import json
@@ -11,12 +12,14 @@ from unittest.mock import Mock, patch
 
 from flask import url_for
 
+from changedetectionio.browser_steps.browser_steps import steppable_browser_interface
 from changedetectionio.processors.page_and_files.linked_files import (
     _request_with_redirects,
     _verification_interval,
     discover_file_urls,
     fingerprint_file,
     fingerprint_files,
+    render_snapshot,
 )
 from changedetectionio.processors.page_and_files.processor import perform_site_check
 from changedetectionio.processors.text_json_diff.processor import (
@@ -67,6 +70,272 @@ class FakeResponse:
 
     def iter_content(self, chunk_size):
         return [b'x']
+
+
+class FakeJSONResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
+
+    def close(self):
+        return None
+
+
+def test_kernel_controlled_navigation_is_bounded_and_uses_dom_content_loaded():
+    observed = {}
+
+    class Page:
+        async def goto(self, url, **kwargs):
+            observed.update({'url': url, **kwargs})
+            return object()
+
+    browser = steppable_browser_interface('https://example.com')
+    browser.page = Page()
+    browser.action_timeout = 45000
+    asyncio.run(browser.action_goto_url(value='https://example.com/data'))
+
+    assert observed == {
+        'url': 'https://example.com/data',
+        'timeout': 45000,
+        'wait_until': 'domcontentloaded',
+    }
+
+
+def test_page_processor_uses_one_local_fingerprint_batch_call():
+    state = {
+        'files': {'https://files.example/report.pdf': {'sha256': 'digest'}},
+        'discovered_count': 1,
+        'truncated': False,
+    }
+    with (
+        patch.dict(os.environ, {'LINKED_FILE_BATCH_URL': 'http://127.0.0.1:3100/fingerprint'}),
+        patch('requests.post', return_value=FakeJSONResponse(state)) as post,
+    ):
+        result = fingerprint_files(
+            ['https://files.example/report.pdf'],
+            {},
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={'https': 'http://proxy.example:8080'},
+            timeout=45,
+        )
+
+    assert result == state
+    assert post.call_count == 1
+    assert post.call_args.kwargs['json']['urls'] == ['https://files.example/report.pdf']
+    assert post.call_args.kwargs['json']['source_url'] == 'https://page.example/data'
+    assert post.call_args.kwargs['json']['proxies'] == {'https': 'http://proxy.example:8080'}
+
+
+def test_blocked_metadata_is_resolved_in_one_batch_without_redownloading():
+    class BlockedResponse(FakeResponse):
+        status_code = 403
+
+    urls = [f'https://files.example/report-{index}.pdf' for index in range(8)]
+    previous = {
+        'files': {
+            url: {
+                'url': url,
+                'final_url': url,
+                'etag': f'etag-{index}',
+                'last_modified': '',
+                'content_length': '10',
+                'content_type': 'application/pdf',
+                'sha256': f'sha-{index}',
+                'last_hashed_at': time.time(),
+                'check_metadata': {
+                    'final_url': url,
+                    'etag': f'etag-{index}',
+                    'last_modified': '',
+                    'content_length': '10',
+                    'content_type': 'application/pdf',
+                },
+            }
+            for index, url in enumerate(urls)
+        }
+    }
+    batch = FakeJSONResponse({
+        'results': [
+            {
+                'source_url': url,
+                'final_url': url,
+                'status': 200,
+                'tier': 'kernel_stealth',
+                'etag': f'etag-{index}',
+                'content_length': '10',
+                'content_type': 'application/pdf',
+            }
+            for index, url in enumerate(urls)
+        ]
+    })
+
+    def request(self, method, url, **kwargs):
+        assert method == 'HEAD'
+        return BlockedResponse(url)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true',
+                'LINKED_FILE_METADATA_BATCH_FALLBACK_URL': 'http://127.0.0.1:3100/metadata-batch',
+                'LINKED_FILE_VERIFY_INTERVAL_SECONDS': '604800',
+                'LINKED_FILE_VERIFY_JITTER_SECONDS': '0',
+            },
+        ),
+        patch('requests.Session.request', new=request),
+        patch('requests.post', return_value=batch) as post,
+        patch('requests.get') as get,
+    ):
+        result = fingerprint_files(
+            urls,
+            previous,
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=45,
+        )
+
+    assert len(result['files']) == 8
+    assert result['fallback_metadata_count'] == 8
+    assert all(not value.get('error') for value in result['files'].values())
+    assert post.call_count == 1
+    assert set(post.call_args.kwargs['json']['urls']) == set(urls)
+    get.assert_not_called()
+
+
+def test_direct_file_checks_reuse_one_session_per_worker():
+    created = []
+
+    class Session:
+        def __init__(self):
+            created.append(self)
+
+        def request(self, method, url, **kwargs):
+            return FakeResponse(url)
+
+        def close(self):
+            return None
+
+    urls = [f'https://files.example/report-{index}.pdf' for index in range(20)]
+    previous = {
+        'files': {
+            url: {
+                'url': url,
+                'final_url': url,
+                'etag': url,
+                'last_modified': '',
+                'content_length': '1',
+                'content_type': '',
+                'sha256': 'existing',
+                'last_hashed_at': time.time(),
+            }
+            for url in urls
+        }
+    }
+    with (
+        patch.dict(os.environ, {'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true', 'LINKED_FILE_HEAD_WORKERS': '2'}),
+        patch('requests.Session', side_effect=Session),
+    ):
+        result = fingerprint_files(
+            urls,
+            previous,
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=45,
+        )
+
+    assert len(result['files']) == 20
+    assert 1 <= len(created) <= 2
+
+
+def test_rate_limited_head_is_not_retried_through_the_waterfall():
+    class RateLimitedResponse(FakeResponse):
+        status_code = 429
+
+    def request(self, method, url, **kwargs):
+        return RateLimitedResponse(url)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true',
+                'LINKED_FILE_METADATA_FALLBACK_URL': 'http://127.0.0.1:3100/metadata',
+                'LINKED_FILE_BINARY_FALLBACK_URL': 'http://127.0.0.1:3100/binary',
+            },
+        ),
+        patch('requests.Session.request', new=request),
+        patch('requests.get') as fallback,
+    ):
+        result = fingerprint_file(
+            'https://files.example/report.pdf',
+            {},
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=45,
+            now=1,
+        )
+
+    assert result['error'] == 'HEAD returned HTTP 429; retry later'
+    fallback.assert_not_called()
+
+
+def test_linked_file_notification_only_lists_changed_files_and_is_capped():
+    previous = {
+        'files': [
+            {
+                'url': f'https://files.example/{index}.pdf',
+                'content_length': '10',
+                'last_modified': '',
+                'etag': f'etag-{index}',
+                'sha256': f'old-{index}',
+            }
+            for index in range(30)
+        ],
+        'discovered_count': 30,
+        'truncated': False,
+    }
+    current = {
+        **previous,
+        'files': [
+            {**item, 'sha256': item['sha256'].replace('old-', 'new-')}
+            for item in previous['files']
+        ],
+    }
+
+    with patch.dict(os.environ, {'LINKED_FILE_NOTIFICATION_LIMIT': '25'}):
+        rendered = render_snapshot(current, previous)
+
+    assert rendered.startswith('LINKED FILES: 0 added, 30 changed, 0 removed (30 checked)')
+    assert rendered.count('\nCHANGED ') == 25
+    assert '... and 5 more linked-file changes' in rendered
+
+
+def test_linked_file_notification_does_not_repeat_unchanged_catalog():
+    snapshot = {
+        'files': [
+            {
+                'url': 'https://files.example/report.pdf',
+                'content_length': '10',
+                'last_modified': '',
+                'etag': 'etag',
+                'sha256': 'same',
+            }
+        ],
+        'discovered_count': 1,
+        'truncated': False,
+    }
+
+    assert render_snapshot(snapshot, snapshot) == (
+        'LINKED FILES: 0 added, 0 changed, 0 removed (1 checked)'
+    )
 
 
 def test_linked_file_headers_do_not_leak_across_origins():
@@ -638,4 +907,5 @@ def test_page_and_files_detects_link_removal(client, live_server, datastore_path
     watch = live_server.app.config['DATASTORE'].data['watching'][uuid]
     assert len(watch.history) == 2
     latest = watch.get_history_snapshot(timestamp=list(watch.history.keys())[-1])
-    assert 'LINKED FILES\n(none discovered)' in latest
+    assert 'LINKED FILES: 0 added, 0 changed, 1 removed (0 checked)' in latest
+    assert 'REMOVED ' in latest

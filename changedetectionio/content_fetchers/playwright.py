@@ -301,6 +301,7 @@ class fetcher(Fetcher):
             from changedetectionio.browser_steps.browser_steps import steppable_browser_interface
             browsersteps_interface = steppable_browser_interface(start_url=url)
             browsersteps_interface.page = self.page
+            browsersteps_interface.action_timeout = max(1000, int(float(timeout or 45) * 1000))
 
             response = await browsersteps_interface.action_goto_url(value=url)
 
@@ -469,6 +470,5 @@ class PlaywrightFetcherPlugin:
 
 # Create module-level instance for plugin registration
 playwright_plugin = PlaywrightFetcherPlugin()
-
 
 
