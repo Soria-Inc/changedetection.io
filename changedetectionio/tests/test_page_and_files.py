@@ -19,7 +19,9 @@ from changedetectionio.processors.page_and_files.linked_files import (
     fingerprint_files,
 )
 from changedetectionio.processors.page_and_files.processor import perform_site_check
-from changedetectionio.processors.text_json_diff.processor import perform_site_check as text_site_check
+from changedetectionio.processors.text_json_diff.processor import (
+    perform_site_check as text_site_check,
+)
 
 from .util import wait_for_all_checks
 
@@ -163,6 +165,146 @@ def test_linked_file_requests_keep_tls_verification_enabled():
         session.close()
 
     assert 'verify' not in observed[0]
+
+
+def test_blocked_linked_file_uses_binary_waterfall_without_changing_source_identity():
+    class BlockedResponse(FakeResponse):
+        status_code = 403
+
+    class WaterfallResponse(FakeResponse):
+        def __init__(self):
+            self.headers = {
+                'Content-Length': '20',
+                'Content-Type': 'application/zip',
+                'X-Soria-Upstream-Final-URL': 'https%3A%2F%2Ffiles.example%2Freport.zip',
+                'X-Soria-Waterfall-Tier': 'browser_use_proxy',
+            }
+
+        def iter_content(self, chunk_size):
+            return [b'blocked file content']
+
+    def request(self, method, url, **kwargs):
+        return BlockedResponse(url)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true',
+                'LINKED_FILE_BINARY_FALLBACK_URL': 'http://127.0.0.1:3100/binary',
+            },
+        ),
+        patch('requests.Session.request', new=request),
+        patch('requests.get', return_value=WaterfallResponse()) as fallback,
+    ):
+        result = fingerprint_file(
+            'https://files.example/report.zip',
+            {},
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=5,
+            now=1,
+        )
+
+    assert result['url'] == 'https://files.example/report.zip'
+    assert result['final_url'] == 'https://files.example/report.zip'
+    assert result['sha256'] == hashlib.sha256(b'blocked file content').hexdigest()
+    assert result['fetch_route'] == 'binary_waterfall'
+    assert result['waterfall_tier'] == 'browser_use_proxy'
+    assert fallback.call_args.args[0] == (
+        'http://127.0.0.1:3100/binary?url=https%3A%2F%2Ffiles.example%2Freport.zip'
+    )
+
+
+def test_missing_link_does_not_use_binary_waterfall():
+    class MissingResponse(FakeResponse):
+        status_code = 404
+
+    def request(self, method, url, **kwargs):
+        return MissingResponse(url)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true',
+                'LINKED_FILE_BINARY_FALLBACK_URL': 'http://127.0.0.1:3100/binary',
+            },
+        ),
+        patch('requests.Session.request', new=request),
+        patch('requests.get') as fallback,
+    ):
+        result = fingerprint_file(
+            'https://files.example/missing.zip',
+            {},
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=5,
+            now=1,
+        )
+
+    assert result['error'] == 'GET returned HTTP 404'
+    fallback.assert_not_called()
+
+
+def test_blocked_head_uses_metadata_waterfall_without_redownloading_unchanged_file():
+    class BlockedResponse(FakeResponse):
+        status_code = 403
+
+    class MetadataResponse(FakeResponse):
+        def __init__(self):
+            self.headers = {
+                'X-Soria-Upstream-Final-URL': 'https%3A%2F%2Ffiles.example%2Freport.zip',
+                'X-Soria-Upstream-ETag': 'release-7',
+                'X-Soria-Upstream-Last-Modified': 'Tue, 21 Jul 2026 10:00:00 GMT',
+                'X-Soria-Upstream-Content-Length': '1234',
+                'X-Soria-Upstream-Content-Type': 'application/zip',
+                'X-Soria-Waterfall-Tier': 'kernel_stealth',
+            }
+
+    def request(self, method, url, **kwargs):
+        return BlockedResponse(url)
+
+    previous = {
+        'final_url': 'https://files.example/report.zip',
+        'etag': 'release-7',
+        'last_modified': 'Tue, 21 Jul 2026 10:00:00 GMT',
+        'content_length': '1234',
+        'content_type': 'application/zip',
+        'sha256': 'existing-sha',
+        'last_hashed_at': 100,
+    }
+    with (
+        patch.dict(
+            os.environ,
+            {
+                'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true',
+                'LINKED_FILE_METADATA_FALLBACK_URL': 'http://127.0.0.1:3100/metadata',
+                'LINKED_FILE_BINARY_FALLBACK_URL': 'http://127.0.0.1:3100/binary',
+                'LINKED_FILE_VERIFY_INTERVAL_SECONDS': '604800',
+                'LINKED_FILE_VERIFY_JITTER_SECONDS': '0',
+            },
+        ),
+        patch('requests.Session.request', new=request),
+        patch('requests.get', return_value=MetadataResponse()) as fallback,
+    ):
+        result = fingerprint_file(
+            'https://files.example/report.zip',
+            previous,
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=5,
+            now=200,
+        )
+
+    assert result['sha256'] == 'existing-sha'
+    assert result['metadata_route'] == 'metadata_waterfall'
+    assert result['waterfall_tier'] == 'kernel_stealth'
+    assert fallback.call_count == 1
+    assert '/metadata?' in fallback.call_args.args[0]
 
 
 def test_linked_file_concurrency_is_globally_and_per_host_bounded():
