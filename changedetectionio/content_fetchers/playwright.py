@@ -303,7 +303,23 @@ class fetcher(Fetcher):
             browsersteps_interface.page = self.page
             browsersteps_interface.action_timeout = max(1000, int(float(timeout or 45) * 1000))
 
-            response = await browsersteps_interface.action_goto_url(value=url)
+            try:
+                response = await browsersteps_interface.action_goto_url(value=url)
+            except playwright._impl._errors.TimeoutError as exc:
+                try:
+                    await asyncio.wait_for(context.close(), timeout=5.0)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(browser.close(), timeout=5.0)
+                except Exception:
+                    pass
+                self.page = None
+                raise PageUnloadable(
+                    url=url,
+                    status_code=None,
+                    message=f"Navigation timed out after {float(timeout or 45):g} seconds",
+                ) from exc
 
             if response is None:
                 await context.close()
@@ -470,5 +486,4 @@ class PlaywrightFetcherPlugin:
 
 # Create module-level instance for plugin registration
 playwright_plugin = PlaywrightFetcherPlugin()
-
 
