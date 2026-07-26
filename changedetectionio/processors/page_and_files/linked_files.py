@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import quote, unquote, urldefrag, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -165,25 +165,164 @@ def _metadata(url, final_url, headers):
     }
 
 
-def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
-    previous = previous or {}
-    head_session = head = None
-    request_session = requests.Session()
+def _binary_fallback(url, *, timeout):
+    base_url = os.getenv('LINKED_FILE_BINARY_FALLBACK_URL', '').strip()
+    if not base_url:
+        raise ValueError('binary fallback is not configured')
+    separator = '&' if '?' in base_url else '?'
+    fallback_url = f'{base_url}{separator}url={quote(url, safe="")}'
+    response = requests.get(fallback_url, allow_redirects=False, stream=True, timeout=timeout)
+    if not 200 <= response.status_code < 300:
+        response.close()
+        raise ValueError(f'binary fallback returned HTTP {response.status_code}')
+    encoded_final_url = response.headers.get('X-Soria-Upstream-Final-URL') or ''
+    final_url = unquote(encoded_final_url) if encoded_final_url else url
+    return response, final_url
+
+
+def _metadata_fallback(url, *, timeout):
+    base_url = os.getenv('LINKED_FILE_METADATA_FALLBACK_URL', '').strip()
+    if not base_url:
+        raise ValueError('metadata fallback is not configured')
+    separator = '&' if '?' in base_url else '?'
+    fallback_url = f'{base_url}{separator}url={quote(url, safe="")}'
+    response = requests.get(fallback_url, allow_redirects=False, timeout=timeout)
+    try:
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f'metadata fallback returned HTTP {response.status_code}')
+        encoded_final_url = response.headers.get('X-Soria-Upstream-Final-URL') or ''
+        final_url = unquote(encoded_final_url) if encoded_final_url else url
+        upstream_headers = {
+            'ETag': response.headers.get('X-Soria-Upstream-ETag') or '',
+            'Last-Modified': response.headers.get('X-Soria-Upstream-Last-Modified') or '',
+            'Content-Length': response.headers.get('X-Soria-Upstream-Content-Length') or '',
+            'Content-Type': response.headers.get('X-Soria-Upstream-Content-Type') or '',
+        }
+        return _metadata(url, final_url, upstream_headers), response.headers.get('X-Soria-Waterfall-Tier') or ''
+    finally:
+        response.close()
+
+
+def _hash_response(url, response, final_url, *, now, fetch_route):
+    max_bytes = int(os.getenv('LINKED_FILE_MAX_BYTES', str(250 * 1024 * 1024)))
+    declared_length = response.headers.get('Content-Length')
+    try:
+        declared_byte_count = int(declared_length) if declared_length else None
+    except ValueError:
+        declared_byte_count = None
+    if declared_byte_count is not None and declared_byte_count > max_bytes:
+        raise ValueError(f'file is {declared_byte_count} bytes; limit is {max_bytes} bytes')
+
+    digest = hashlib.sha256()
+    byte_count = 0
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
+        if not chunk:
+            continue
+        byte_count += len(chunk)
+        if byte_count > max_bytes:
+            raise ValueError(f'file exceeded the {max_bytes}-byte limit')
+        digest.update(chunk)
+    metadata = _metadata(url, final_url, response.headers)
+    if not metadata['content_length']:
+        metadata['content_length'] = str(byte_count)
+    return {
+        **metadata,
+        'sha256': digest.hexdigest(),
+        'last_hashed_at': now,
+        'fetch_route': fetch_route,
+        **(
+            {'waterfall_tier': response.headers['X-Soria-Waterfall-Tier']}
+            if response.headers.get('X-Soria-Waterfall-Tier')
+            else {}
+        ),
+    }
+
+
+def _check_metadata(url, *, source_url, headers, proxies, timeout, session):
+    metadata_route = 'direct'
+    metadata_tier = ''
     try:
         with _request_capacity(url, 'head'):
-            head_session, head, final_url = _request_with_redirects(
+            _, head, final_url = _request_with_redirects(
                 'HEAD',
                 url,
                 headers=headers,
                 source_url=source_url,
                 proxies=proxies,
                 timeout=timeout,
-                session=request_session,
+                session=session,
             )
-            head_supported = 200 <= head.status_code < 300
-            metadata = _metadata(url, final_url, head.headers)
-            head.close()
-            head = head_session = None
+            try:
+                head_supported = 200 <= head.status_code < 300
+                head_status = head.status_code
+                metadata = _metadata(url, final_url, head.headers)
+            finally:
+                head.close()
+        should_fallback = not head_supported and (
+            head_status in {401, 403, 407, 429, 451} or head_status >= 500
+        )
+    except (requests.RequestException, OSError):
+        head_supported = False
+        metadata = _metadata(url, url, {})
+        should_fallback = True
+
+    if should_fallback and os.getenv('LINKED_FILE_METADATA_FALLBACK_URL', '').strip():
+        try:
+            metadata, metadata_tier = _metadata_fallback(url, timeout=timeout)
+            metadata_route = 'metadata_waterfall'
+            head_supported = True
+        except Exception:
+            pass
+    return metadata, head_supported, metadata_route, metadata_tier
+
+
+def _download_and_hash(url, *, source_url, headers, proxies, timeout, session, now):
+    response = None
+    with _request_capacity(url, 'hash'):
+        try:
+            try:
+                _, response, final_url = _request_with_redirects(
+                    'GET',
+                    url,
+                    headers=headers,
+                    source_url=source_url,
+                    proxies=proxies,
+                    timeout=timeout,
+                    stream=True,
+                    session=session,
+                )
+                if not 200 <= response.status_code < 300:
+                    status_code = response.status_code
+                    response.close()
+                    response = None
+                    if status_code not in {401, 403, 407, 429, 451} and status_code < 500:
+                        raise ValueError(f'GET returned HTTP {status_code}')
+                    raise requests.HTTPError(f'GET returned HTTP {status_code}')
+                return _hash_response(url, response, final_url, now=now, fetch_route='direct')
+            except (requests.RequestException, OSError):
+                if response is not None:
+                    response.close()
+                if not os.getenv('LINKED_FILE_BINARY_FALLBACK_URL', '').strip():
+                    raise
+                response, final_url = _binary_fallback(url, timeout=timeout)
+                return _hash_response(url, response, final_url, now=now, fetch_route='binary_waterfall')
+        finally:
+            if response is not None:
+                response.close()
+
+
+def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
+    previous = previous or {}
+    request_session = requests.Session()
+    try:
+        metadata, head_supported, metadata_route, metadata_tier = _check_metadata(
+            url,
+            source_url=source_url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            session=request_session,
+        )
 
         metadata_changed = any(str(previous.get(key, '')) != str(metadata[key]) for key in METADATA_KEYS)
         reliable_headers = bool(metadata['etag'] or metadata['last_modified'] or metadata['content_length'])
@@ -196,52 +335,37 @@ def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, n
         )
 
         if not needs_hash:
-            return {**metadata, 'sha256': previous['sha256'], 'last_hashed_at': previous['last_hashed_at']}
+            return {
+                **metadata,
+                'sha256': previous['sha256'],
+                'last_hashed_at': previous['last_hashed_at'],
+                'metadata_route': metadata_route,
+                **({'waterfall_tier': metadata_tier} if metadata_route == 'metadata_waterfall' else {}),
+            }
 
-        with _request_capacity(url, 'hash'):
-            _, response, final_url = _request_with_redirects(
-                'GET',
-                url,
-                headers=headers,
-                source_url=source_url,
-                proxies=proxies,
-                timeout=timeout,
-                stream=True,
-                session=request_session,
-            )
-            try:
-                if not 200 <= response.status_code < 300:
-                    raise ValueError(f"GET returned HTTP {response.status_code}")
-                max_bytes = int(os.getenv('LINKED_FILE_MAX_BYTES', str(250 * 1024 * 1024)))
-                declared_length = response.headers.get('Content-Length')
-                try:
-                    declared_byte_count = int(declared_length) if declared_length else None
-                except ValueError:
-                    declared_byte_count = None
-                if declared_byte_count is not None and declared_byte_count > max_bytes:
-                    raise ValueError(f"file is {declared_byte_count} bytes; limit is {max_bytes} bytes")
-
-                digest = hashlib.sha256()
-                byte_count = 0
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    byte_count += len(chunk)
-                    if byte_count > max_bytes:
-                        raise ValueError(f"file exceeded the {max_bytes}-byte limit")
-                    digest.update(chunk)
-                metadata = _metadata(url, final_url, response.headers)
-                if not metadata['content_length']:
-                    metadata['content_length'] = str(byte_count)
-                return {**metadata, 'sha256': digest.hexdigest(), 'last_hashed_at': now}
-            finally:
-                response.close()
+        result = _download_and_hash(
+            url,
+            source_url=source_url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            session=request_session,
+            now=now,
+        )
+        result['metadata_route'] = metadata_route
+        return result
     except Exception as exc:
-        if head is not None:
-            head.close()
-        if head_session is not None:
-            head_session.close()
-        preserved = {key: previous.get(key, '') for key in (*METADATA_KEYS, 'sha256', 'last_hashed_at')}
+        preserved = {
+            key: previous.get(key, '')
+            for key in (
+                *METADATA_KEYS,
+                'sha256',
+                'last_hashed_at',
+                'fetch_route',
+                'metadata_route',
+                'waterfall_tier',
+            )
+        }
         return {'url': url, **preserved, 'error': str(exc)[:300]}
     finally:
         request_session.close()
