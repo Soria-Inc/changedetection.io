@@ -105,9 +105,11 @@ def discover_file_urls(html, page_url):
         if not href or href.startswith(('#', 'data:', 'javascript:', 'mailto:', 'tel:')):
             continue
         absolute_url = urldefrag(urljoin(effective_base_url, href)).url
-        path = urlparse(absolute_url).path.lower()
+        parsed_url = urlparse(absolute_url)
+        path = parsed_url.path.lower()
         is_download = anchor.has_attr('download') or any(path.endswith(ext) for ext in FILE_EXTENSIONS)
-        if is_download and urlparse(absolute_url).scheme in ('http', 'https'):
+        hostname = parsed_url.hostname or ''
+        if is_download and parsed_url.scheme in ('http', 'https') and '.' in hostname:
             urls.add(absolute_url)
     return sorted(urls)
 
@@ -165,13 +167,17 @@ def _metadata(url, final_url, headers):
     }
 
 
+def _fallback_timeout(timeout):
+    return max(float(timeout or 0), float(os.getenv('LINKED_FILE_FALLBACK_TIMEOUT_SECONDS', '120')))
+
+
 def _binary_fallback(url, *, timeout):
     base_url = os.getenv('LINKED_FILE_BINARY_FALLBACK_URL', '').strip()
     if not base_url:
         raise ValueError('binary fallback is not configured')
     separator = '&' if '?' in base_url else '?'
     fallback_url = f'{base_url}{separator}url={quote(url, safe="")}'
-    response = requests.get(fallback_url, allow_redirects=False, stream=True, timeout=timeout)
+    response = requests.get(fallback_url, allow_redirects=False, stream=True, timeout=_fallback_timeout(timeout))
     if not 200 <= response.status_code < 300:
         response.close()
         raise ValueError(f'binary fallback returned HTTP {response.status_code}')
@@ -186,7 +192,7 @@ def _metadata_fallback(url, *, timeout):
         raise ValueError('metadata fallback is not configured')
     separator = '&' if '?' in base_url else '?'
     fallback_url = f'{base_url}{separator}url={quote(url, safe="")}'
-    response = requests.get(fallback_url, allow_redirects=False, timeout=timeout)
+    response = requests.get(fallback_url, allow_redirects=False, timeout=_fallback_timeout(timeout))
     try:
         if not 200 <= response.status_code < 300:
             raise ValueError(f'metadata fallback returned HTTP {response.status_code}')

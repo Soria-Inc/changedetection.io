@@ -41,6 +41,7 @@ def test_page_and_files_discovers_downloads_without_head_checking_navigation():
         <a href="archive.zip">Archive</a>
         <a href="/download?id=42" download>Download</a>
         <a href="/images/logo.png">Logo</a>
+        <a href="http://image/broken-report.pdf">Broken single-label host</a>
     '''
     assert discover_file_urls(html, 'https://example.com/path/page') == [
         'https://downloads.example.com/download?id=42',
@@ -215,6 +216,7 @@ def test_blocked_linked_file_uses_binary_waterfall_without_changing_source_ident
     assert fallback.call_args.args[0] == (
         'http://127.0.0.1:3100/binary?url=https%3A%2F%2Ffiles.example%2Freport.zip'
     )
+    assert fallback.call_args.kwargs['timeout'] == 120.0
 
 
 def test_missing_link_does_not_use_binary_waterfall():
@@ -315,6 +317,7 @@ def test_blocked_head_uses_metadata_waterfall_without_redownloading_unchanged_fi
     assert result['waterfall_tier'] == 'kernel_stealth'
     assert fallback.call_count == 1
     assert '/metadata?' in fallback.call_args.args[0]
+    assert fallback.call_args.kwargs['timeout'] == 120.0
 
 
 def test_linked_file_concurrency_is_globally_and_per_host_bounded():
