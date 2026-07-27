@@ -406,6 +406,8 @@ def _fingerprint_file(
         metadata, head_supported, metadata_route, metadata_tier, head_status = checked_metadata
         if head_status == 429:
             raise ValueError('HEAD returned HTTP 429; retry later')
+        if metadata_route == 'metadata_deferred':
+            raise ValueError('metadata batch unresolved; preserved previous fingerprint for retry')
 
         previous_check_metadata = previous.get('check_metadata') or {
             key: previous.get(key, '') for key in METADATA_KEYS
@@ -459,6 +461,8 @@ def _fingerprint_file(
                 'check_metadata',
             )
         }
+        if checked_metadata is not None and checked_metadata[2] == 'metadata_deferred':
+            preserved['metadata_route'] = 'metadata_deferred'
         return {'url': url, **preserved, 'error': str(exc)[:300]}
     finally:
         if owns_session:
@@ -604,12 +608,15 @@ def _fingerprint_files_local(urls, previous_state, *, source_url, headers, proxi
                 for url, (_, supported, _, _, status) in metadata_results.items()
                 if not supported and (status == 0 or status in {401, 403, 407, 451} or status >= 500)
             ]
+            batch_fallback_configured = bool(
+                os.getenv('LINKED_FILE_METADATA_BATCH_FALLBACK_URL', '').strip()
+            )
             try:
                 metadata_results.update(_metadata_fallback_batch(fallback_urls, timeout=timeout))
             except Exception:
                 pass
 
-            unresolved = [url for url in fallback_urls if metadata_results[url][2] == 'direct']
+            unresolved = [url for url in fallback_urls if not metadata_results[url][1]]
 
             def individual_fallback(url):
                 try:
@@ -618,8 +625,31 @@ def _fingerprint_files_local(urls, previous_state, *, source_url, headers, proxi
                     return url, metadata_results[url]
                 return url, (metadata, True, 'metadata_waterfall', tier, 200)
 
-            if unresolved:
-                metadata_results.update(executor.map(individual_fallback, unresolved))
+            individual_limit = max(
+                0,
+                int(os.getenv('LINKED_FILE_INDIVIDUAL_FALLBACK_MAX_URLS', '4')),
+            )
+            individual_urls = (
+                unresolved
+                if not batch_fallback_configured or len(unresolved) <= individual_limit
+                else []
+            )
+            metadata_results.update(executor.map(individual_fallback, individual_urls))
+
+            deferred_urls = [url for url in unresolved if not metadata_results[url][1]]
+            metadata_results.update(
+                (
+                    url,
+                    (
+                        metadata_results[url][0],
+                        False,
+                        'metadata_deferred',
+                        metadata_results[url][3],
+                        metadata_results[url][4],
+                    ),
+                )
+                for url in deferred_urls
+            )
             for url, result in executor.map(check, selected_urls):
                 files[url] = result
     finally:
@@ -634,6 +664,9 @@ def _fingerprint_files_local(urls, previous_state, *, source_url, headers, proxi
         'direct_metadata_count': sum(value.get('metadata_route') == 'direct' for value in files.values()),
         'fallback_metadata_count': sum(
             value.get('metadata_route') == 'metadata_waterfall' for value in files.values()
+        ),
+        'deferred_metadata_count': sum(
+            value.get('metadata_route') == 'metadata_deferred' for value in files.values()
         ),
         'error_count': sum(bool(value.get('error')) for value in files.values()),
     }
