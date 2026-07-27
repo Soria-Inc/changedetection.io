@@ -23,6 +23,8 @@ _SAFE_CROSS_ORIGIN_HEADERS = frozenset({'accept', 'accept-language', 'user-agent
 _limiter_lock = threading.Lock()
 _global_limiters = {}
 _host_limiters = {}
+_host_rate_lock = threading.Lock()
+_host_next_request = {}
 _inflight_lock = threading.Lock()
 _inflight_fingerprints = {}
 
@@ -46,6 +48,21 @@ def _worker_limit(name, default):
     return max(1, int(os.getenv(name, legacy_limit or default)))
 
 
+def _wait_for_host_rate(url):
+    requests_per_second = float(os.getenv('LINKED_FILE_PER_HOST_RPS', '0') or 0)
+    if requests_per_second <= 0:
+        return
+    hostname = (urlparse(url).hostname or '').lower()
+    spacing = 1 / requests_per_second
+    with _host_rate_lock:
+        now = time.monotonic()
+        slot = max(now, _host_next_request.get(hostname, now))
+        _host_next_request[hostname] = slot + spacing
+    delay = slot - now
+    if delay > 0:
+        time.sleep(delay)
+
+
 @contextmanager
 def _request_capacity(url, phase):
     setting = 'LINKED_FILE_HEAD_GLOBAL_WORKERS' if phase == 'head' else 'LINKED_FILE_HASH_WORKERS'
@@ -64,6 +81,7 @@ def _request_capacity(url, phase):
         )
     with global_limiter:
         with host_limiter:
+            _wait_for_host_rate(url)
             yield
 
 
@@ -78,7 +96,7 @@ def _verification_interval(url):
     return max(1, interval - jitter // 2 + offset)
 
 
-def _fingerprint_key(url, previous, *, source_url, headers, proxies, timeout, now):
+def _fingerprint_key(url, previous, *, source_url, headers, proxies, timeout, now, checked_metadata=None):
     previous = previous or {}
     cache_scope = {
         'url': url,
@@ -91,6 +109,7 @@ def _fingerprint_key(url, previous, *, source_url, headers, proxies, timeout, no
             'check_metadata': previous.get('check_metadata') or {},
         },
         'verification_due': now - float(previous.get('last_hashed_at') or 0) >= _verification_interval(url),
+        'checked_metadata': checked_metadata,
     }
     return hashlib.sha256(json.dumps(cache_scope, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -209,6 +228,44 @@ def _metadata_fallback(url, *, timeout):
         response.close()
 
 
+def _metadata_fallback_batch(urls, *, timeout):
+    base_url = os.getenv('LINKED_FILE_METADATA_BATCH_FALLBACK_URL', '').strip()
+    if not base_url or not urls:
+        return {}
+    response = requests.post(
+        base_url,
+        json={'urls': list(urls)},
+        timeout=_fallback_timeout(timeout),
+    )
+    try:
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f'metadata batch fallback returned HTTP {response.status_code}')
+        payload = response.json()
+    finally:
+        response.close()
+
+    results = {}
+    for item in payload.get('results') or []:
+        url = str(item.get('source_url') or '')
+        if url not in urls:
+            continue
+        status = int(item.get('status') or 0)
+        headers = {
+            'ETag': item.get('etag') or '',
+            'Last-Modified': item.get('last_modified') or '',
+            'Content-Length': item.get('content_length') or '',
+            'Content-Type': item.get('content_type') or '',
+        }
+        results[url] = (
+            _metadata(url, str(item.get('final_url') or url), headers),
+            200 <= status < 300,
+            'metadata_waterfall',
+            str(item.get('tier') or ''),
+            status,
+        )
+    return results
+
+
 def _hash_response(url, response, final_url, *, now, fetch_route):
     max_bytes = int(os.getenv('LINKED_FILE_MAX_BYTES', str(250 * 1024 * 1024)))
     declared_length = response.headers.get('Content-Length')
@@ -244,7 +301,7 @@ def _hash_response(url, response, final_url, *, now, fetch_route):
     }
 
 
-def _check_metadata(url, *, source_url, headers, proxies, timeout, session):
+def _check_metadata(url, *, source_url, headers, proxies, timeout, session, allow_fallback=True):
     metadata_route = 'direct'
     metadata_tier = ''
     try:
@@ -265,21 +322,23 @@ def _check_metadata(url, *, source_url, headers, proxies, timeout, session):
             finally:
                 head.close()
         should_fallback = not head_supported and (
-            head_status in {401, 403, 407, 429, 451} or head_status >= 500
+            head_status in {401, 403, 407, 451} or head_status >= 500
         )
     except (requests.RequestException, OSError):
         head_supported = False
+        head_status = 0
         metadata = _metadata(url, url, {})
         should_fallback = True
 
-    if should_fallback and os.getenv('LINKED_FILE_METADATA_FALLBACK_URL', '').strip():
+    if allow_fallback and should_fallback and os.getenv('LINKED_FILE_METADATA_FALLBACK_URL', '').strip():
         try:
             metadata, metadata_tier = _metadata_fallback(url, timeout=timeout)
             metadata_route = 'metadata_waterfall'
             head_supported = True
+            head_status = 200
         except Exception:
             pass
-    return metadata, head_supported, metadata_route, metadata_tier
+    return metadata, head_supported, metadata_route, metadata_tier, head_status
 
 
 def _download_and_hash(url, *, source_url, headers, proxies, timeout, session, now):
@@ -301,6 +360,8 @@ def _download_and_hash(url, *, source_url, headers, proxies, timeout, session, n
                     status_code = response.status_code
                     response.close()
                     response = None
+                    if status_code == 429:
+                        raise ValueError('GET returned HTTP 429; retry later')
                     if status_code not in {401, 403, 407, 429, 451} and status_code < 500:
                         raise ValueError(f'GET returned HTTP {status_code}')
                     raise requests.HTTPError(f'GET returned HTTP {status_code}')
@@ -317,18 +378,34 @@ def _download_and_hash(url, *, source_url, headers, proxies, timeout, session, n
                 response.close()
 
 
-def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
+def _fingerprint_file(
+    url,
+    previous,
+    *,
+    source_url,
+    headers,
+    proxies,
+    timeout,
+    now,
+    checked_metadata=None,
+    request_session=None,
+):
     previous = previous or {}
-    request_session = requests.Session()
+    owns_session = request_session is None
+    request_session = request_session or requests.Session()
     try:
-        metadata, head_supported, metadata_route, metadata_tier = _check_metadata(
-            url,
-            source_url=source_url,
-            headers=headers,
-            proxies=proxies,
-            timeout=timeout,
-            session=request_session,
-        )
+        if checked_metadata is None:
+            checked_metadata = _check_metadata(
+                url,
+                source_url=source_url,
+                headers=headers,
+                proxies=proxies,
+                timeout=timeout,
+                session=request_session,
+            )
+        metadata, head_supported, metadata_route, metadata_tier, head_status = checked_metadata
+        if head_status == 429:
+            raise ValueError('HEAD returned HTTP 429; retry later')
 
         previous_check_metadata = previous.get('check_metadata') or {
             key: previous.get(key, '') for key in METADATA_KEYS
@@ -384,10 +461,22 @@ def _fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, n
         }
         return {'url': url, **preserved, 'error': str(exc)[:300]}
     finally:
-        request_session.close()
+        if owns_session:
+            request_session.close()
 
 
-def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, now):
+def fingerprint_file(
+    url,
+    previous,
+    *,
+    source_url,
+    headers,
+    proxies,
+    timeout,
+    now,
+    checked_metadata=None,
+    request_session=None,
+):
     key = _fingerprint_key(
         url,
         previous,
@@ -396,6 +485,7 @@ def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, no
         proxies=proxies,
         timeout=timeout,
         now=now,
+        checked_metadata=checked_metadata,
     )
     with _inflight_lock:
         future = _inflight_fingerprints.get(key)
@@ -415,6 +505,8 @@ def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, no
             proxies=proxies,
             timeout=timeout,
             now=now,
+            checked_metadata=checked_metadata,
+            request_session=request_session,
         )
         future.set_result(result)
         return result
@@ -426,7 +518,33 @@ def fingerprint_file(url, previous, *, source_url, headers, proxies, timeout, no
             _inflight_fingerprints.pop(key, None)
 
 
-def fingerprint_files(urls, previous_state, *, source_url, headers, proxies, timeout):
+def _fingerprint_files_remote(urls, previous_state, *, source_url, headers, proxies, timeout):
+    batch_url = os.getenv('LINKED_FILE_BATCH_URL', '').strip()
+    response = requests.post(
+        batch_url,
+        json={
+            'source_url': source_url,
+            'urls': list(urls),
+            'previous_state': previous_state or {},
+            'headers': dict(headers or {}),
+            'proxies': dict(proxies or {}),
+            'timeout': timeout,
+        },
+        timeout=float(os.getenv('LINKED_FILE_BATCH_TIMEOUT_SECONDS', '540')),
+    )
+    try:
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f'linked-file batch returned HTTP {response.status_code}')
+        state = response.json()
+    finally:
+        response.close()
+    if not isinstance(state, dict) or not isinstance(state.get('files'), dict):
+        raise ValueError('linked-file batch returned invalid state')
+    return state
+
+
+def _fingerprint_files_local(urls, previous_state, *, source_url, headers, proxies, timeout):
+    scan_started = time.monotonic()
     maximum = max(1, int(os.getenv('LINKED_FILE_MAX_LINKS', '200')))
     selected_urls = list(urls[:maximum])
     if len(selected_urls) > 1:
@@ -439,6 +557,29 @@ def fingerprint_files(urls, previous_state, *, source_url, headers, proxies, tim
     now = time.time()
     worker_limit = max(1, int(os.getenv('LINKED_FILE_HEAD_WORKERS', '2')))
     workers = min(worker_limit, max(1, len(selected_urls)))
+    session_local = threading.local()
+    sessions = []
+    sessions_lock = threading.Lock()
+
+    def worker_session():
+        session = getattr(session_local, 'session', None)
+        if session is None:
+            session = requests.Session()
+            session_local.session = session
+            with sessions_lock:
+                sessions.append(session)
+        return session
+
+    def direct_metadata(url):
+        return url, _check_metadata(
+            url,
+            source_url=source_url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            session=worker_session(),
+            allow_fallback=False,
+        )
 
     def check(url):
         return url, fingerprint_file(
@@ -449,18 +590,73 @@ def fingerprint_files(urls, previous_state, *, source_url, headers, proxies, tim
             proxies=proxies,
             timeout=timeout,
             now=now,
+            checked_metadata=metadata_results[url],
+            request_session=worker_session(),
         )
 
     files = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        for url, result in executor.map(check, selected_urls):
-            files[url] = result
+    metadata_results = {}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            metadata_results.update(executor.map(direct_metadata, selected_urls))
+            fallback_urls = [
+                url
+                for url, (_, supported, _, _, status) in metadata_results.items()
+                if not supported and (status == 0 or status in {401, 403, 407, 451} or status >= 500)
+            ]
+            try:
+                metadata_results.update(_metadata_fallback_batch(fallback_urls, timeout=timeout))
+            except Exception:
+                pass
+
+            unresolved = [url for url in fallback_urls if metadata_results[url][2] == 'direct']
+
+            def individual_fallback(url):
+                try:
+                    metadata, tier = _metadata_fallback(url, timeout=timeout)
+                except Exception:
+                    return url, metadata_results[url]
+                return url, (metadata, True, 'metadata_waterfall', tier, 200)
+
+            if unresolved:
+                metadata_results.update(executor.map(individual_fallback, unresolved))
+            for url, result in executor.map(check, selected_urls):
+                files[url] = result
+    finally:
+        for session in sessions:
+            session.close()
 
     return {
         'files': files,
         'discovered_count': len(urls),
         'truncated': len(urls) > maximum,
+        'scan_duration_seconds': round(time.monotonic() - scan_started, 3),
+        'direct_metadata_count': sum(value.get('metadata_route') == 'direct' for value in files.values()),
+        'fallback_metadata_count': sum(
+            value.get('metadata_route') == 'metadata_waterfall' for value in files.values()
+        ),
+        'error_count': sum(bool(value.get('error')) for value in files.values()),
     }
+
+
+def fingerprint_files(urls, previous_state, *, source_url, headers, proxies, timeout):
+    if os.getenv('LINKED_FILE_BATCH_URL', '').strip():
+        return _fingerprint_files_remote(
+            urls,
+            previous_state,
+            source_url=source_url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+        )
+    return _fingerprint_files_local(
+        urls,
+        previous_state,
+        source_url=source_url,
+        headers=headers,
+        proxies=proxies,
+        timeout=timeout,
+    )
 
 
 def stable_snapshot(state):
@@ -478,21 +674,65 @@ def stable_snapshot(state):
     }
 
 
-def render_snapshot(snapshot):
-    lines = ['LINKED FILES']
-    if not snapshot['files']:
-        lines.append('(none discovered)')
-    for item in snapshot['files']:
-        line = item['url']
-        if item.get('error'):
-            line += f" | error={item['error']}"
-        else:
-            line += (
-                f" | size={item['content_length'] or 'unknown'}"
+def render_snapshot(snapshot, previous_snapshot=None):
+    current = {item['url']: item for item in snapshot['files']}
+    limit = max(1, int(os.getenv('LINKED_FILE_NOTIFICATION_LIMIT', '25')))
+    if previous_snapshot is None:
+        lines = [f"LINKED FILES: baseline recorded for {len(current)} files"]
+        for url, item in sorted(current.items())[:limit]:
+            lines.append(
+                f"FILE {url} | size={item['content_length'] or 'unknown'}"
                 f" | modified={item['last_modified'] or 'unknown'}"
                 f" | sha256={item['sha256'] or 'unavailable'}"
             )
-        lines.append(line)
+        if len(current) > limit:
+            lines.append(f"... and {len(current) - limit} more baseline files")
+    else:
+        previous = {item['url']: item for item in previous_snapshot['files']}
+        added = sorted(current.keys() - previous.keys())
+        removed = sorted(previous.keys() - current.keys())
+        changed = sorted(url for url in current.keys() & previous.keys() if current[url] != previous[url])
+        lines = [
+            f"LINKED FILES: {len(added)} added, {len(changed)} changed, "
+            f"{len(removed)} removed ({len(current)} checked)"
+        ]
+        changes = [*[("ADDED", url) for url in added], *[("CHANGED", url) for url in changed],
+                   *[("REMOVED", url) for url in removed]]
+        for change, url in changes[:limit]:
+            if change == 'REMOVED':
+                lines.append(f"REMOVED {url}")
+                continue
+            item = current[url]
+            if change == 'ADDED':
+                detail = (
+                    f"size={item['content_length'] or 'unknown'}"
+                    f" | modified={item['last_modified'] or 'unknown'}"
+                    f" | sha256={item['sha256'] or 'unavailable'}"
+                )
+            else:
+                prior = previous[url]
+                fields = []
+                for label, key in (
+                    ('size', 'content_length'),
+                    ('modified', 'last_modified'),
+                    ('etag', 'etag'),
+                    ('sha256', 'sha256'),
+                    ('error', 'error'),
+                ):
+                    before = str(prior.get(key) or 'none')
+                    after = str(item.get(key) or 'none')
+                    if before != after:
+                        fields.append(
+                            f"{label}={before if key == 'sha256' else before[:40]}"
+                            f" -> {after if key == 'sha256' else after[:40]}"
+                        )
+                detail = ' | '.join(fields) or 'metadata changed'
+            lines.append(f"{change} {url} | {detail}")
+        if len(changes) > limit:
+            lines.append(f"... and {len(changes) - limit} more linked-file changes")
     if snapshot['truncated']:
-        lines.append(f"WARNING: only the first {len(snapshot['files'])} of {snapshot['discovered_count']} files were checked")
+        lines.append(
+            f"WARNING: only the first {len(snapshot['files'])} of "
+            f"{snapshot['discovered_count']} files were checked"
+        )
     return '\n'.join(lines)

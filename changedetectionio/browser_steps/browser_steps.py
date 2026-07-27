@@ -137,7 +137,15 @@ class steppable_browser_interface():
             return None
             
         now = time.time()
-        response = await self.page.goto(value, timeout=0, wait_until='load')
+        # A remote CDP browser can otherwise occupy a worker forever when a
+        # publisher never fires the full ``load`` event.  DOMContentLoaded plus
+        # the configured action timeout is sufficient for the extractor, which
+        # already performs its own render-settle delay afterwards.
+        response = await self.page.goto(
+            value,
+            timeout=self.action_timeout,
+            wait_until='domcontentloaded',
+        )
         logger.debug(f"Time to goto URL {time.time()-now:.2f}s")
         return response
 
@@ -505,4 +513,3 @@ class browsersteps_live_ui(steppable_browser_interface):
             pass
             
         return (screenshot, xpath_data)
-
