@@ -208,6 +208,78 @@ def test_blocked_metadata_is_resolved_in_one_batch_without_redownloading():
     get.assert_not_called()
 
 
+def test_large_failed_metadata_batch_preserves_hashes_without_individual_fallbacks():
+    class BlockedResponse(FakeResponse):
+        status_code = 403
+
+    urls = [f'https://files.example/report-{index}.pdf' for index in range(8)]
+    previous = {
+        'files': {
+            url: {
+                'url': url,
+                'final_url': url,
+                'etag': f'etag-{index}',
+                'last_modified': '',
+                'content_length': '10',
+                'content_type': 'application/pdf',
+                'sha256': f'sha-{index}',
+                'last_hashed_at': time.time(),
+            }
+            for index, url in enumerate(urls)
+        }
+    }
+    failed_batch = FakeJSONResponse({
+        'results': [
+            {
+                'source_url': url,
+                'final_url': url,
+                'status': 0,
+                'error': 'Kernel metadata batch failed',
+            }
+            for url in urls
+        ]
+    })
+
+    def request(self, method, url, **kwargs):
+        assert method == 'HEAD'
+        return BlockedResponse(url)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                'ALLOW_IANA_RESTRICTED_ADDRESSES': 'true',
+                'LINKED_FILE_METADATA_BATCH_FALLBACK_URL': 'http://127.0.0.1:3100/metadata-batch',
+                'LINKED_FILE_METADATA_FALLBACK_URL': 'http://127.0.0.1:3100/metadata',
+                'LINKED_FILE_BINARY_FALLBACK_URL': 'http://127.0.0.1:3100/binary',
+                'LINKED_FILE_INDIVIDUAL_FALLBACK_MAX_URLS': '4',
+            },
+        ),
+        patch('requests.Session.request', new=request),
+        patch('requests.post', return_value=failed_batch) as post,
+        patch('requests.get') as fallback,
+    ):
+        result = fingerprint_files(
+            urls,
+            previous,
+            source_url='https://page.example/data',
+            headers={'User-Agent': 'Soria'},
+            proxies={},
+            timeout=45,
+        )
+
+    assert post.call_count == 1
+    fallback.assert_not_called()
+    assert result['deferred_metadata_count'] == len(urls)
+    assert result['error_count'] == len(urls)
+    assert all(result['files'][url]['sha256'] == previous['files'][url]['sha256'] for url in urls)
+    assert all(
+        result['files'][url]['error']
+        == 'metadata batch unresolved; preserved previous fingerprint for retry'
+        for url in urls
+    )
+
+
 def test_direct_file_checks_reuse_one_session_per_worker():
     created = []
 
