@@ -359,7 +359,7 @@ def test_rate_limited_head_is_not_retried_through_the_waterfall():
     fallback.assert_not_called()
 
 
-def test_linked_file_notification_only_lists_changed_files_and_is_capped():
+def test_linked_file_snapshot_is_stable_current_state_for_native_diffing():
     previous = {
         'files': [
             {
@@ -382,15 +382,18 @@ def test_linked_file_notification_only_lists_changed_files_and_is_capped():
         ],
     }
 
-    with patch.dict(os.environ, {'LINKED_FILE_NOTIFICATION_LIMIT': '25'}):
-        rendered = render_snapshot(current, previous)
+    previous_rendered = render_snapshot(previous)
+    current_rendered = render_snapshot(current)
 
-    assert rendered.startswith('LINKED FILES: 0 added, 30 changed, 0 removed (30 checked)')
-    assert rendered.count('\nCHANGED ') == 25
-    assert '... and 5 more linked-file changes' in rendered
+    assert previous_rendered.startswith('LINKED FILES\nhttps://files.example/0.pdf')
+    assert current_rendered.startswith('LINKED FILES\nhttps://files.example/0.pdf')
+    assert previous_rendered.count('\nhttps://files.example/') == 30
+    assert current_rendered.count('\nhttps://files.example/') == 30
+    assert 'sha256=old-0' in previous_rendered
+    assert 'sha256=new-0' in current_rendered
 
 
-def test_linked_file_notification_does_not_repeat_unchanged_catalog():
+def test_linked_file_snapshot_does_not_change_for_unchanged_catalog():
     snapshot = {
         'files': [
             {
@@ -405,8 +408,9 @@ def test_linked_file_notification_does_not_repeat_unchanged_catalog():
         'truncated': False,
     }
 
-    assert render_snapshot(snapshot, snapshot) == (
-        'LINKED FILES: 0 added, 0 changed, 0 removed (1 checked)'
+    assert render_snapshot(snapshot) == (
+        'LINKED FILES\n'
+        'https://files.example/report.pdf | size=10 | modified=unknown | sha256=same'
     )
 
 
@@ -928,6 +932,10 @@ def test_page_and_files_monitors_page_and_linked_file_in_one_watch(client, live_
     with open(counter_path, encoding='utf-8') as counter_file:
         assert json.load(counter_file) == {'GET': 2, 'HEAD': 4}
 
+    client.get(url_for('ui.form_watch_checknow'), follow_redirects=True)
+    wait_for_all_checks(client)
+    assert len(watch.history) == 3
+
 
 def test_page_and_files_preloaded_first_check_includes_file_baseline(client, live_server, datastore_path):
     from changedetectionio.blueprint.ui.views import run_preloaded_first_check
@@ -971,7 +979,7 @@ def test_page_and_files_weekly_hash_catches_same_metadata_replacement(client, li
 
 
 def test_page_and_files_detects_link_removal(client, live_server, datastore_path):
-    uuid, _ = create_watch(client, live_server, datastore_path)
+    uuid, file_url = create_watch(client, live_server, datastore_path)
     write_manifest(datastore_path, [])
     client.get(url_for('ui.form_watch_checknow'), follow_redirects=True)
     wait_for_all_checks(client)
@@ -979,5 +987,5 @@ def test_page_and_files_detects_link_removal(client, live_server, datastore_path
     watch = live_server.app.config['DATASTORE'].data['watching'][uuid]
     assert len(watch.history) == 2
     latest = watch.get_history_snapshot(timestamp=list(watch.history.keys())[-1])
-    assert 'LINKED FILES: 0 added, 0 changed, 1 removed (0 checked)' in latest
-    assert 'REMOVED ' in latest
+    assert 'LINKED FILES\n(none discovered)' in latest
+    assert file_url not in latest

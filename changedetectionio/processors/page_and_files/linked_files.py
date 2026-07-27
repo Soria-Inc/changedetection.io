@@ -707,62 +707,21 @@ def stable_snapshot(state):
     }
 
 
-def render_snapshot(snapshot, previous_snapshot=None):
-    current = {item['url']: item for item in snapshot['files']}
-    limit = max(1, int(os.getenv('LINKED_FILE_NOTIFICATION_LIMIT', '25')))
-    if previous_snapshot is None:
-        lines = [f"LINKED FILES: baseline recorded for {len(current)} files"]
-        for url, item in sorted(current.items())[:limit]:
-            lines.append(
-                f"FILE {url} | size={item['content_length'] or 'unknown'}"
+def render_snapshot(snapshot):
+    lines = ['LINKED FILES']
+    if not snapshot['files']:
+        lines.append('(none discovered)')
+    for item in snapshot['files']:
+        line = item['url']
+        if item.get('error'):
+            line += f" | error={item['error']}"
+        else:
+            line += (
+                f" | size={item['content_length'] or 'unknown'}"
                 f" | modified={item['last_modified'] or 'unknown'}"
                 f" | sha256={item['sha256'] or 'unavailable'}"
             )
-        if len(current) > limit:
-            lines.append(f"... and {len(current) - limit} more baseline files")
-    else:
-        previous = {item['url']: item for item in previous_snapshot['files']}
-        added = sorted(current.keys() - previous.keys())
-        removed = sorted(previous.keys() - current.keys())
-        changed = sorted(url for url in current.keys() & previous.keys() if current[url] != previous[url])
-        lines = [
-            f"LINKED FILES: {len(added)} added, {len(changed)} changed, "
-            f"{len(removed)} removed ({len(current)} checked)"
-        ]
-        changes = [*[("ADDED", url) for url in added], *[("CHANGED", url) for url in changed],
-                   *[("REMOVED", url) for url in removed]]
-        for change, url in changes[:limit]:
-            if change == 'REMOVED':
-                lines.append(f"REMOVED {url}")
-                continue
-            item = current[url]
-            if change == 'ADDED':
-                detail = (
-                    f"size={item['content_length'] or 'unknown'}"
-                    f" | modified={item['last_modified'] or 'unknown'}"
-                    f" | sha256={item['sha256'] or 'unavailable'}"
-                )
-            else:
-                prior = previous[url]
-                fields = []
-                for label, key in (
-                    ('size', 'content_length'),
-                    ('modified', 'last_modified'),
-                    ('etag', 'etag'),
-                    ('sha256', 'sha256'),
-                    ('error', 'error'),
-                ):
-                    before = str(prior.get(key) or 'none')
-                    after = str(item.get(key) or 'none')
-                    if before != after:
-                        fields.append(
-                            f"{label}={before if key == 'sha256' else before[:40]}"
-                            f" -> {after if key == 'sha256' else after[:40]}"
-                        )
-                detail = ' | '.join(fields) or 'metadata changed'
-            lines.append(f"{change} {url} | {detail}")
-        if len(changes) > limit:
-            lines.append(f"... and {len(changes) - limit} more linked-file changes")
+        lines.append(line)
     if snapshot['truncated']:
         lines.append(
             f"WARNING: only the first {len(snapshot['files'])} of "
