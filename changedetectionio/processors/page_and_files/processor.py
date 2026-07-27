@@ -59,8 +59,7 @@ class perform_site_check(text_site_check):
         encoded_snapshot = json.dumps(snapshot, separators=(',', ':'), sort_keys=True)
         snapshot_checksum = hashlib.sha256(encoded_snapshot.encode('utf-8')).hexdigest()
         self.fetcher.content += f'\n<!-- linked-files-sha256:{snapshot_checksum} -->'
-        previous_snapshot = stable_snapshot(previous) if previous else None
-        self.fetcher.supplemental_change_content = render_snapshot(snapshot, previous_snapshot)
+        self.fetcher.supplemental_change_content = render_snapshot(snapshot)
         self.linked_files_state = state
 
     async def call_browser(self, preferred_proxy_id=None):
